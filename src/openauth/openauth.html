@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>OpenAuth</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    background: #dfe6df;
+    color: #111;
+    user-select: none;
+    overflow: hidden;
+  }
+
+  /* --- Setup --- */
+  .setup {
+    padding: 10px 12px;
+  }
+
+  .setup input {
+    width: 100%;
+    padding: 5px 7px;
+    background: #fff;
+    border: 1px solid #b0b8b0;
+    border-radius: 3px;
+    color: #111;
+    font-family: monospace;
+    font-size: 12px;
+    outline: none;
+  }
+
+  .setup input:focus { border-color: #1a3a6a; }
+
+  .setup button {
+    margin-top: 6px;
+    padding: 4px 10px;
+    background: #1a3a6a;
+    border: none;
+    border-radius: 3px;
+    color: #fff;
+    font-size: 11px;
+    cursor: pointer;
+    width: 100%;
+  }
+
+  .setup button:hover { background: #264d85; }
+
+  .saved-key-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 3px 6px;
+    background: #cdd4cd;
+    border-radius: 3px;
+    margin-top: 4px;
+    cursor: pointer;
+    font-size: 11px;
+  }
+
+  .saved-key-item:hover { background: #c0c8c0; }
+  .saved-key-item .rm { color: #944; font-size: 10px; opacity: 0; cursor: pointer; }
+  .saved-key-item:hover .rm { opacity: 1; }
+
+  /* --- Token view --- */
+  .token-row {
+    display: flex;
+    align-items: center;
+    padding: 6px 10px 3px;
+    gap: 0;
+  }
+
+  .code {
+    font-family: 'SF Mono', 'Menlo', 'Consolas', monospace;
+    font-size: 16px;
+    font-weight: 600;
+    color: #111;
+    letter-spacing: 2px;
+    white-space: nowrap;
+    margin-right: 10px;
+    cursor: default;
+    transition: color 0.15s;
+  }
+
+  .code.copied-flash { color: #2a8a3a; }
+  .code.flash { opacity: 0.3; transition: opacity 0.12s; }
+
+  .btn {
+    background: none;
+    border: none;
+    color: #1a3a6a;
+    font-size: 11px;
+    font-weight: 500;
+    cursor: pointer;
+    padding: 2px 4px;
+    border-radius: 3px;
+    white-space: nowrap;
+    font-family: inherit;
+  }
+
+  .btn:hover { background: rgba(26,58,106,0.1); }
+  .btn.copied { color: #2a8a3a; font-weight: 600; }
+
+  /* --- Discrete progress blocks --- */
+  .progress {
+    display: flex;
+    gap: 2px;
+    padding: 0 10px 6px;
+  }
+
+  .progress .block {
+    flex: 1;
+    height: 3px;
+    background: #aab2aa;
+    border-radius: 1px;
+    transition: opacity 0.3s;
+  }
+
+  .progress .block.off { opacity: 0.15; }
+
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+
+<!-- Setup -->
+<div class="setup" id="setupView">
+  <input type="text" id="secretInput" placeholder="Base32 secret key" autocomplete="off" spellcheck="false">
+  <button onclick="activate()">Save</button>
+  <div id="savedKeys"></div>
+</div>
+
+<!-- Token -->
+<div id="tokenView" class="hidden">
+  <div class="token-row">
+    <span class="code" id="codeDisplay">--- ---</span>
+    <button class="btn" id="copyBtn" onclick="copyCode()">copy</button>
+    <button class="btn" onclick="showNext()">next</button>
+    <button class="btn" onclick="showSetup()">esc</button>
+  </div>
+  <div class="progress" id="progressBar"></div>
+</div>
+
+<script>
+// --- Encrypted Storage (IndexedDB + AES-GCM) ---
+const DB = 'openauth', STORE = 'keys';
+
+function openDB() {
+  return new Promise((res, rej) => {
+    const r = indexedDB.open(DB, 1);
+    r.onupgradeneeded = () => r.result.createObjectStore(STORE);
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  });
+}
+
+async function getEncKey() {
+  const db = await openDB();
+  return new Promise(async (res) => {
+    const tx = db.transaction(STORE, 'readonly');
+    const r = tx.objectStore(STORE).get('enckey');
+    r.onsuccess = async () => {
+      if (r.result) { res(r.result); return; }
+      const key = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+      const w = db.transaction(STORE, 'readwrite');
+      w.objectStore(STORE).put(key, 'enckey');
+      res(key);
+    };
+  });
+}
+
+async function encryptStr(s) {
+  const key = await getEncKey();
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const enc = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(s));
+  const buf = new Uint8Array(iv.length + enc.byteLength);
+  buf.set(iv); buf.set(new Uint8Array(enc), iv.length);
+  return btoa(String.fromCharCode(...buf));
+}
+
+async function decryptStr(s) {
+  const key = await getEncKey();
+  const buf = Uint8Array.from(atob(s), c => c.charCodeAt(0));
+  const dec = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: buf.slice(0,12) }, key, buf.slice(12));
+  return new TextDecoder().decode(dec);
+}
+
+async function getSavedKeys() {
+  try {
+    const raw = localStorage.getItem('openauth_enc');
+    if (!raw) return [];
+    const entries = JSON.parse(raw);
+    const out = [];
+    for (const e of entries) {
+      try { out.push({ secret: await decryptStr(e.enc) }); } catch {}
+    }
+    return out;
+  } catch { return []; }
+}
+
+async function saveKey(secret) {
+  const keys = await getSavedKeys();
+  if (keys.some(k => k.secret === secret)) return;
+  keys.push({ secret });
+  const entries = [];
+  for (const k of keys) entries.push({ enc: await encryptStr(k.secret) });
+  localStorage.setItem('openauth_enc', JSON.stringify(entries));
+}
+
+async function deleteKey(secret) {
+  const keys = (await getSavedKeys()).filter(k => k.secret !== secret);
+  const entries = [];
+  for (const k of keys) entries.push({ enc: await encryptStr(k.secret) });
+  localStorage.setItem('openauth_enc', JSON.stringify(entries));
+  renderSavedKeys();
+}
+
+// --- Base32 + TOTP ---
+function base32Decode(input) {
+  const A = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+  input = input.replace(/[\s=-]+/g, '').toUpperCase();
+  const L = {}; for (let i = 0; i < A.length; i++) L[A[i]] = i;
+  let bits = 0, val = 0, out = [];
+  for (const c of input) {
+    if (!(c in L)) throw new Error('bad');
+    val = (val << 5) | L[c]; bits += 5;
+    if (bits >= 8) { bits -= 8; out.push((val >>> bits) & 0xff); }
+  }
+  return new Uint8Array(out);
+}
+
+async function totp(secret, offset = 0) {
+  const key = base32Decode(secret);
+  const ctr = Math.floor(Date.now() / 30000) + offset;
+  const msg = new ArrayBuffer(8);
+  new DataView(msg).setUint32(4, ctr, false);
+  const k = await crypto.subtle.importKey('raw', key, { name: 'HMAC', hash: 'SHA-1' }, false, ['sign']);
+  const h = new Uint8Array(await crypto.subtle.sign('HMAC', k, new Uint8Array(msg)));
+  const o = h[h.length-1] & 0x0f;
+  const bin = ((h[o]&0x7f)<<24|(h[o+1]&0xff)<<16|(h[o+2]&0xff)<<8|h[o+3]&0xff) % 1000000;
+  return bin.toString().padStart(6, '0');
+}
+
+// --- State ---
+let currentSecret = '', showingNext = false, timer = null;
+
+// --- Progress blocks ---
+function initBlocks() {
+  const el = document.getElementById('progressBar');
+  el.innerHTML = '';
+  for (let i = 0; i < 10; i++) {
+    const b = document.createElement('div');
+    b.className = 'block';
+    el.appendChild(b);
+  }
+}
+
+function updateBlocks() {
+  const remaining = 30 - (Math.floor(Date.now() / 1000) % 30);
+  const lit = Math.ceil(remaining / 3); // 10 blocks, each ~3s
+  document.querySelectorAll('.progress .block').forEach((b, i) => {
+    b.classList.toggle('off', i >= lit);
+  });
+}
+
+// --- UI ---
+async function renderSavedKeys() {
+  const keys = await getSavedKeys();
+  const el = document.getElementById('savedKeys');
+  if (!keys.length) { el.innerHTML = ''; return; }
+  el.innerHTML = keys.map((k) => {
+    const masked = k.secret.slice(0,4) + '...' + k.secret.slice(-4);
+    return `<div class="saved-key-item" data-s="${k.secret}">
+      <span>${masked}</span><span class="rm">remove</span>
+    </div>`;
+  }).join('');
+  el.querySelectorAll('.saved-key-item').forEach(item => {
+    const s = item.dataset.s;
+    item.addEventListener('click', () => { currentSecret = s; startToken(); });
+    item.querySelector('.rm').addEventListener('click', (e) => { e.stopPropagation(); deleteKey(s); });
+  });
+}
+
+async function activate() {
+  const raw = document.getElementById('secretInput').value.trim();
+  if (!raw) return;
+  try { base32Decode(raw); } catch { alert('Invalid Base32 key.'); return; }
+  currentSecret = raw.replace(/[\s=-]+/g, '').toUpperCase();
+  await saveKey(currentSecret);
+  startToken();
+}
+
+function startToken() {
+  document.getElementById('setupView').classList.add('hidden');
+  document.getElementById('tokenView').classList.remove('hidden');
+  showingNext = false;
+  initBlocks();
+  updateDisplay();
+  if (timer) clearInterval(timer);
+  timer = setInterval(updateDisplay, 1000);
+}
+
+function showSetup() {
+  if (timer) clearInterval(timer);
+  document.getElementById('tokenView').classList.add('hidden');
+  document.getElementById('setupView').classList.remove('hidden');
+  renderSavedKeys();
+}
+
+async function updateDisplay() {
+  const code = await totp(currentSecret, showingNext ? 1 : 0);
+  const el = document.getElementById('codeDisplay');
+  el.textContent = code.slice(0,3) + ' ' + code.slice(3);
+  updateBlocks();
+  const remaining = 30 - (Math.floor(Date.now()/1000) % 30);
+  if (remaining === 30) {
+    showingNext = false;
+    el.classList.add('flash');
+    setTimeout(() => el.classList.remove('flash'), 120);
+  }
+}
+
+function showNext() { showingNext = !showingNext; updateDisplay(); }
+
+async function copyCode() {
+  const code = await totp(currentSecret, showingNext ? 1 : 0);
+  await navigator.clipboard.writeText(code);
+  const btn = document.getElementById('copyBtn');
+  const codeEl = document.getElementById('codeDisplay');
+  btn.textContent = '\u2713'; btn.classList.add('copied');
+  codeEl.classList.add('copied-flash');
+  setTimeout(() => {
+    btn.textContent = 'copy'; btn.classList.remove('copied');
+    codeEl.classList.remove('copied-flash');
+  }, 1000);
+}
+
+// --- Keyboard ---
+document.addEventListener('keydown', (e) => {
+  if (e.target.tagName === 'INPUT') { if (e.key === 'Enter') activate(); return; }
+  if (document.getElementById('tokenView').classList.contains('hidden')) return;
+  if (e.key === 'c' || ((e.metaKey || e.ctrlKey) && e.key === 'c')) { e.preventDefault(); copyCode(); }
+  else if (e.key === 'n') showNext();
+  else if (e.key === 'Escape') showSetup();
+});
+
+// --- Double-click code to copy ---
+document.addEventListener('dblclick', (e) => {
+  if (e.target.id === 'codeDisplay' || e.target.closest('#codeDisplay')) copyCode();
+});
+
+// --- Init ---
+(async () => {
+  const keys = await getSavedKeys();
+  if (keys.length >= 1) { currentSecret = keys[0].secret; startToken(); }
+  else renderSavedKeys();
+})();
+</script>
+</body>
+</html>
