@@ -330,13 +330,30 @@ def notify(title: str, message: str) -> None:
     system = platform.system()
     try:
         if system == "Darwin":
-            ## osascript talks to macOS Notification Center via AppleScript.
-            ## `display notification` is a built-in AppleScript command.
-            subprocess.Popen([
-                "osascript",
-                "-e",
-                f'display notification "{message}" with title "{title}"',
-            ])
+            if shutil.which("alerter") is not None:
+                ## alerter is a maintained macOS notification CLI that works
+                ## on macOS 14+. Install via: brew install alerter
+                subprocess.Popen([
+                    "alerter",
+                    "-title", title,
+                    "-message", message,
+                    "-sound", "default",
+                ])
+            elif shutil.which("terminal-notifier") is not None:
+                subprocess.Popen([
+                    "terminal-notifier",
+                    "-title", title,
+                    "-message", message,
+                    "-sound", "default",
+                ])
+            else:
+                ## Fallback: osascript (goes to Notification Center only;
+                ## banners require Script Editor permission in System Settings).
+                subprocess.Popen([
+                    "osascript",
+                    "-e",
+                    f'display notification "{message}" with title "{title}" sound name "default"',
+                ])
 
         elif system == "Windows":
             ## Windows 10+ toast notifications via PowerShell and the UWP
